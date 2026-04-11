@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import shlex
+import json
 import hashlib
 import fnmatch
 import logging
@@ -257,6 +258,83 @@ def _resolve_max_chunks_per_file(override: Optional[int] = None) -> int:
         )
         return MAX_CHUNKS_PER_FILE
     return val
+
+
+# =============================================================================
+# EPOCH TRACKING
+# =============================================================================
+#
+# Each mine run increments a monotonic epoch counter stored in
+# {palace}/epoch.json. Every chunk is tagged with its mine_epoch in metadata,
+# giving every drawer a "generation number" that identifies which mine run
+# produced it. This enables:
+#   - Knowing how stale a chunk is (current_epoch - chunk.mine_epoch)
+#   - Reconstructing the palace state at any previous epoch
+#   - Auditing which mine run introduced any given piece of content
+#
+# REVISION SNAPSHOTS
+# ------------------
+# When a file is re-mined, upstream's #521 fix (delete-before-insert) purges
+# all existing chunks for that file before the fresh ones are written. This
+# avoids hnswlib segfaults but also destroys the previous version of the file.
+# _snapshot_revisions() runs just before that delete, capturing the chunks to
+# {palace}/revisions.jsonl so the previous version can still be retrieved.
+
+
+def _load_epoch(palace_path: str) -> int:
+    """Load the current mine epoch from the palace. Returns 0 if none exists."""
+    epoch_file = os.path.join(palace_path, "epoch.json")
+    if os.path.exists(epoch_file):
+        try:
+            with open(epoch_file) as f:
+                return json.load(f).get("current", 0)
+        except Exception:
+            return 0
+    return 0
+
+
+def _save_epoch(palace_path: str, epoch: int):
+    """Persist the current mine epoch."""
+    epoch_file = os.path.join(palace_path, "epoch.json")
+    with open(epoch_file, "w") as f:
+        json.dump({
+            "current": epoch,
+            "last_mine": datetime.now().isoformat(),
+        }, f)
+
+
+def _snapshot_revisions(palace_path: str, collection, source_file: str, mine_epoch: int):
+    """Save the current chunks for source_file to revisions.jsonl before deletion.
+
+    Captures each chunk's full content and metadata so the previous version
+    can be reconstructed or queried later. Called just before upstream's
+    delete-before-insert purge in process_file() so that the snapshot records
+    exactly what is about to be discarded.
+    """
+    revisions_path = os.path.join(palace_path, "revisions.jsonl")
+    existing = collection.get(
+        where={"source_file": source_file},
+        include=["documents", "metadatas"],
+    )
+    if not existing.get("ids"):
+        return
+    superseded_at = datetime.now().isoformat()
+    with open(revisions_path, "a") as f:
+        for id_, doc, meta in zip(
+            existing["ids"], existing["documents"], existing["metadatas"]
+        ):
+            record = {
+                "superseded_at": superseded_at,
+                "superseded_by_epoch": mine_epoch,
+                "source_file": meta.get("source_file", ""),
+                "chunk_index": meta.get("chunk_index", 0),
+                "content": doc,
+                "original_epoch": meta.get("mine_epoch", 0),
+                "original_filed_at": meta.get("filed_at", ""),
+                "wing": meta.get("wing", ""),
+                "room": meta.get("room", ""),
+            }
+            f.write(json.dumps(record) + "\n")
 
 
 # =============================================================================
@@ -1400,6 +1478,7 @@ def _build_drawer_metadata(
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
     chunk_total: Optional[int] = None,
+    mine_epoch: int = 0,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1433,6 +1512,7 @@ def _build_drawer_metadata(
         "filed_at": datetime.now().isoformat(),
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
+        "mine_epoch": mine_epoch,
     }
     if source_mtime is not None:
         metadata["source_mtime"] = source_mtime
@@ -1452,7 +1532,8 @@ def _build_drawer_metadata(
 
 
 def add_drawer(
-    collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
+    collection, wing: str, room: str, content: str, source_file: str,
+    chunk_index: int, agent: str, mine_epoch: int = 0,
 ):
     """Add one drawer to the palace.
 
@@ -1466,7 +1547,8 @@ def add_drawer(
     except OSError:
         source_mtime = None
     metadata = _build_drawer_metadata(
-        wing, room, source_file, chunk_index, agent, content, source_mtime
+        wing, room, source_file, chunk_index, agent, content, source_mtime,
+        mine_epoch=mine_epoch,
     )
     collection.upsert(
         documents=[content],
@@ -1494,6 +1576,8 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    palace_path: str = "",
+    mine_epoch: int = 0,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1503,6 +1587,10 @@ def process_file(
     too-short content (below ``min_chunk_size``). It is ``"chunk_cap"``
     when the per-file chunk cap aborted the file. Callers use the tag to
     surface a separate counter in the mine summary (see #1455).
+
+    When a file is re-mined, its existing chunks are snapshotted to
+    {palace}/revisions.jsonl before the delete-before-insert purge, preserving
+    a queryable history of what the file used to contain.
     """
     effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
 
@@ -1555,6 +1643,16 @@ def process_file(
         # Re-check after acquiring lock — another agent may have just finished
         if file_already_mined(collection, source_file, check_mtime=True):
             return 0, room, None
+
+        # Snapshot the current chunks to revisions.jsonl before they get
+        # purged. This runs before the delete-before-insert so we capture
+        # exactly what is about to be discarded. Best-effort — never fail
+        # mining over a snapshot error.
+        if palace_path:
+            try:
+                _snapshot_revisions(palace_path, collection, source_file, mine_epoch)
+            except Exception:
+                pass
 
         # Purge stale drawers for this file before re-inserting the fresh chunks.
         # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
@@ -1627,6 +1725,7 @@ def process_file(
                             line_end=chunk.get("line_end"),
                             content_date=file_content_date,
                             chunk_total=len(chunks),
+                            mine_epoch=mine_epoch,
                         )
                     )
                 assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
@@ -1930,6 +2029,15 @@ def _mine_impl(
 
     from .embedding import describe_device
 
+    # Increment the mine epoch for this run — every chunk filed below will
+    # carry this epoch number in its metadata, and revisions.jsonl records
+    # will use it as the "superseded_by_epoch" marker.
+    if not dry_run:
+        mine_epoch = _load_epoch(palace_path) + 1
+        _save_epoch(palace_path, mine_epoch)
+    else:
+        mine_epoch = 0
+
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine")
     print(f"{'=' * 55}")
@@ -1939,6 +2047,8 @@ def _mine_impl(
     print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {describe_device()}")
+    if not dry_run:
+        print(f"  Epoch:   {mine_epoch}")
     if dry_run:
         print("  DRY RUN -- nothing will be filed")
     if not respect_gitignore:
@@ -1983,6 +2093,8 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    palace_path=palace_path,
+                    mine_epoch=mine_epoch,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we
@@ -2240,7 +2352,7 @@ def status(palace_path: str):
     counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     if counts is not None:
         total, wing_rooms = counts
-        _print_status(total, wing_rooms)
+        _print_status(total, wing_rooms, _load_epoch(palace_path))
         return
 
     col = _open_collection_or_explain(palace_path)
@@ -2274,13 +2386,15 @@ def status(palace_path: str):
             wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
         offset += len(batch)
 
-    _print_status(total, wing_rooms)
+    _print_status(total, wing_rooms, _load_epoch(palace_path))
 
 
-def _print_status(total: int, wing_rooms: dict[str, dict[str, int]]) -> None:
+def _print_status(total: int, wing_rooms: dict[str, dict[str, int]], epoch: int = 0) -> None:
     """Render the wing/room histogram shared by both status code paths."""
     print(f"\n{'=' * 55}")
     print(f"  MemPalace Status -- {total} drawers")
+    if epoch > 0:
+        print(f"  Current epoch: {epoch}")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")
