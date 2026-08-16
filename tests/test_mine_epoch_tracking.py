@@ -44,10 +44,7 @@ def project_dir(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
     (project / "mempalace.yaml").write_text(
-        "wing: test_wing\n"
-        "rooms:\n"
-        "  - name: general\n"
-        "    description: Everything\n"
+        "wing: test_wing\nrooms:\n  - name: general\n    description: Everything\n"
     )
     return project
 
@@ -155,8 +152,7 @@ def test_same_second_mine_bumps_epoch_by_one(palace_dir, project_dir, monkeypatc
     second = miner._load_epoch(palace_dir)
 
     assert second > first, (
-        f"same-second mines should still produce strictly increasing epochs: "
-        f"{first} -> {second}"
+        f"same-second mines should still produce strictly increasing epochs: {first} -> {second}"
     )
     assert second == fixed_now + 1
 
@@ -184,8 +180,7 @@ def test_epoch_survives_cmd_purge_equivalent(palace_dir, project_dir):
     post_purge = miner._load_epoch(palace_dir)
 
     assert post_purge > pre_purge, (
-        f"post-purge epoch should exceed pre-purge epoch: "
-        f"{pre_purge} -> {post_purge}"
+        f"post-purge epoch should exceed pre-purge epoch: {pre_purge} -> {post_purge}"
     )
 
 
@@ -217,8 +212,7 @@ def test_shrinking_file_evicts_orphaned_chunks(palace_dir, project_dir):
     final_count = len(final_result["ids"])
 
     assert final_count < initial_count, (
-        f"expected fewer chunks after shrinking, "
-        f"had {initial_count} before, {final_count} after"
+        f"expected fewer chunks after shrinking, had {initial_count} before, {final_count} after"
     )
 
     # No chunk_index should exceed what the new content produces
@@ -250,17 +244,13 @@ def test_growing_file_keeps_all_chunks(palace_dir, project_dir):
 
     miner.mine(str(project_dir), palace_dir)
     collection = get_collection(palace_dir)
-    initial_count = len(
-        collection.get(where={"source_file": str(target)})["ids"]
-    )
+    initial_count = len(collection.get(where={"source_file": str(target)})["ids"])
 
     time.sleep(0.01)
     target.write_text(_big_content(5))  # grow
     miner.mine(str(project_dir), palace_dir)
 
-    final_count = len(
-        collection.get(where={"source_file": str(target)})["ids"]
-    )
+    final_count = len(collection.get(where={"source_file": str(target)})["ids"])
     assert final_count > initial_count, "growing file should produce more chunks"
 
 
@@ -313,11 +303,7 @@ def test_revision_content_preserves_original_text(palace_dir, project_dir):
     target = project_dir / "a.txt"
     # Put unique, recognizable content in the file
     unique = "UNIQUE_MARKER_STRING_XYZZY_12345"
-    content = (
-        _big_content(3)
-        + "\n\n"
-        + f"Special paragraph with {unique}: " + ("data " * 150)
-    )
+    content = _big_content(3) + "\n\n" + f"Special paragraph with {unique}: " + ("data " * 150)
     target.write_text(content)
 
     miner.mine(str(project_dir), palace_dir)
@@ -386,7 +372,6 @@ def test_revisions_file_tail_truncates_at_max(palace_dir, project_dir, monkeypat
     time.sleep(1.1)
     target.write_text(_big_content(4) + "\n\nround2 marker")
     miner.mine(str(project_dir), palace_dir)
-    round2_epoch = miner._load_epoch(palace_dir)
     after_round2 = len(revisions_path.read_text().splitlines())
     assert after_round2 >= 4, f"expected at least 4 revisions, got {after_round2}"
 
@@ -403,8 +388,7 @@ def test_revisions_file_tail_truncates_at_max(palace_dir, project_dir, monkeypat
     records = [json.loads(line) for line in lines if line.strip()]
     epochs_seen = {r["superseded_by_epoch"] for r in records}
     assert round3_epoch in epochs_seen, (
-        f"newest epoch ({round3_epoch}) should be preserved after truncation, "
-        f"saw {epochs_seen}"
+        f"newest epoch ({round3_epoch}) should be preserved after truncation, saw {epochs_seen}"
     )
 
 
@@ -424,22 +408,26 @@ def test_revisions_time_retention_drops_ancient_records(palace_dir, project_dir,
     revisions_path = Path(palace_dir) / "revisions.jsonl"
     now = int(time.time())
     ancient = now - 7200  # 2 hours ago — way past the 60-second cutoff
-    recent = now - 10     # 10 seconds ago — within the window
 
     # Hand-craft a revisions.jsonl with 4 ancient records + 0 recent
     with open(revisions_path, "w") as f:
         for i in range(4):
-            f.write(json.dumps({
-                "superseded_at": "2020-01-01T00:00:00",
-                "superseded_by_epoch": ancient,
-                "source_file": f"/tmp/ancient_{i}.txt",
-                "chunk_index": i,
-                "content": f"ancient content {i}",
-                "original_epoch": ancient - 1000,
-                "original_filed_at": "2020-01-01T00:00:00",
-                "wing": "test_wing",
-                "room": "general",
-            }) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "superseded_at": "2020-01-01T00:00:00",
+                        "superseded_by_epoch": ancient,
+                        "source_file": f"/tmp/ancient_{i}.txt",
+                        "chunk_index": i,
+                        "content": f"ancient content {i}",
+                        "original_epoch": ancient - 1000,
+                        "original_filed_at": "2020-01-01T00:00:00",
+                        "wing": "test_wing",
+                        "room": "general",
+                    }
+                )
+                + "\n"
+            )
 
     # Now perform a real mine that will append fresh records and trigger
     # truncation because we're already at 4 lines with MAX_REVISIONS=3.
@@ -451,7 +439,7 @@ def test_revisions_time_retention_drops_ancient_records(palace_dir, project_dir,
     miner.mine(str(project_dir), palace_dir)  # re-mine — appends + truncates
 
     lines = revisions_path.read_text().splitlines()
-    records = [json.loads(l) for l in lines if l.strip()]
+    records = [json.loads(line) for line in lines if line.strip()]
 
     # All remaining records should have superseded_by_epoch >= cutoff (now - 60)
     cutoff = int(time.time()) - 60
@@ -475,6 +463,7 @@ def test_mining_works_without_palace_path_arg():
     # Just verify the default argument path — the function signature accepts
     # palace_path="" and mine_epoch=0 as defaults, so old callers don't break.
     import inspect
+
     sig = inspect.signature(miner.process_file)
     assert sig.parameters["palace_path"].default == ""
     assert sig.parameters["mine_epoch"].default == 0

@@ -310,9 +310,7 @@ def _resolve_max_chunks_per_file(override: Optional[int] = None) -> int:
 
 # Soft time-based retention for revisions.jsonl (seconds). Configurable via
 # MEMPALACE_REVISION_RETENTION_DAYS env var. Default: 90 days.
-REVISION_RETENTION_SECONDS = int(
-    os.environ.get("MEMPALACE_REVISION_RETENTION_DAYS", "90")
-) * 86400
+REVISION_RETENTION_SECONDS = int(os.environ.get("MEMPALACE_REVISION_RETENTION_DAYS", "90")) * 86400
 
 # Hard safety cap on revisions.jsonl line count. Each line is a single
 # CHUNK snapshot, not a whole-file revision — a file with N chunks that
@@ -337,13 +335,38 @@ def _load_epoch(palace_path: str) -> int:
 
 
 def _save_epoch(palace_path: str, epoch: int):
-    """Persist the current mine epoch."""
+    """Persist the current mine epoch.
+
+    Creates the palace directory if needed — the epoch is computed before
+    the first collection open, so on a brand-new palace nothing else has
+    created the directory yet.
+    """
+    os.makedirs(palace_path, exist_ok=True)
     epoch_file = os.path.join(palace_path, "epoch.json")
     with open(epoch_file, "w") as f:
-        json.dump({
-            "current": epoch,
-            "last_mine": datetime.now().isoformat(),
-        }, f)
+        json.dump(
+            {
+                "current": epoch,
+                "last_mine": datetime.now().isoformat(),
+            },
+            f,
+        )
+
+
+def _next_mine_epoch(palace_path: str, dry_run: bool) -> int:
+    """Compute and persist the mine epoch for a mine run.
+
+    The epoch is ``int(time.time())`` — the Unix timestamp (seconds) of the
+    mine run. If two mines fire in the same second the later one is bumped
+    to ``previous + 1`` to preserve strict monotonicity. Dry runs get epoch
+    0 and persist nothing (nothing is filed, so no generation is consumed).
+    """
+    if dry_run:
+        return 0
+    previous = _load_epoch(palace_path)
+    epoch = max(int(time.time()), previous + 1)
+    _save_epoch(palace_path, epoch)
+    return epoch
 
 
 def _snapshot_revisions(palace_path: str, collection, source_file: str, mine_epoch: int):
@@ -368,9 +391,7 @@ def _snapshot_revisions(palace_path: str, collection, source_file: str, mine_epo
         return
     superseded_at = datetime.now().isoformat()
     with open(revisions_path, "a") as f:
-        for id_, doc, meta in zip(
-            existing["ids"], existing["documents"], existing["metadatas"]
-        ):
+        for id_, doc, meta in zip(existing["ids"], existing["documents"], existing["metadatas"]):
             record = {
                 "superseded_at": superseded_at,
                 "superseded_by_epoch": mine_epoch,
@@ -1607,8 +1628,14 @@ def _build_drawer_metadata(
 
 
 def add_drawer(
-    collection, wing: str, room: str, content: str, source_file: str,
-    chunk_index: int, agent: str, mine_epoch: int = 0,
+    collection,
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str,
+    chunk_index: int,
+    agent: str,
+    mine_epoch: int = 0,
 ):
     """Add one drawer to the palace.
 
@@ -1622,7 +1649,13 @@ def add_drawer(
     except OSError:
         source_mtime = None
     metadata = _build_drawer_metadata(
-        wing, room, source_file, chunk_index, agent, content, source_mtime,
+        wing,
+        room,
+        source_file,
+        chunk_index,
+        agent,
+        content,
+        source_mtime,
         mine_epoch=mine_epoch,
     )
     collection.upsert(
@@ -2104,17 +2137,11 @@ def _mine_impl(
 
     from .embedding import describe_device
 
-    # Compute the mine epoch for this run. Epoch is int(time.time()) — the
-    # Unix timestamp (seconds) of the mine run. If two mines fire in the
-    # same second we bump to previous + 1 to preserve strict monotonicity.
-    # Every chunk filed below carries this epoch in its metadata, and
-    # revisions.jsonl records use it as the "superseded_by_epoch" marker.
-    if not dry_run:
-        previous = _load_epoch(palace_path)
-        mine_epoch = max(int(time.time()), previous + 1)
-        _save_epoch(palace_path, mine_epoch)
-    else:
-        mine_epoch = 0
+    # Compute the mine epoch for this run (0 on dry runs — nothing is
+    # filed, so no epoch is persisted). Every chunk filed below carries
+    # this epoch in its metadata, and revisions.jsonl records use it as
+    # the "superseded_by_epoch" marker.
+    mine_epoch = _next_mine_epoch(palace_path, dry_run)
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine")
@@ -2125,10 +2152,10 @@ def _mine_impl(
     print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {describe_device()}")
-    if not dry_run:
-        print(f"  Epoch:   {mine_epoch}")
     if dry_run:
         print("  DRY RUN -- nothing will be filed")
+    else:
+        print(f"  Epoch:   {mine_epoch}")
     if not respect_gitignore:
         print("  .gitignore: DISABLED")
     if include_ignored:
